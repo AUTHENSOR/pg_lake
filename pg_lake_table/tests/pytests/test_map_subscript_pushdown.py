@@ -24,6 +24,21 @@ test_cases = [
         "map_array_element",
         "SELECT id, (marr[1])[2] FROM map_subscript.tbl",
     ),
+    # Without the parentheses, Postgres reads these as one subscript of a
+    # multidimensional array, which is NULL for a one-dimensional array,
+    # while DuckDB applies the second subscript to the element.
+    ("map_array_multi_index", "SELECT id, marr[1][2] FROM map_subscript.tbl"),
+    (
+        "map_array_multi_index_where",
+        "SELECT id FROM map_subscript.tbl WHERE marr[1][2] IS NULL",
+    ),
+    ("int_array_multi_index", "SELECT id, ints[1][2] FROM map_subscript.tbl"),
+    ("text_array_multi_index", "SELECT id, tags[1][2] FROM map_subscript.tbl"),
+    (
+        "composite_array_multi_index",
+        "SELECT id, pairs[1][2] FROM map_subscript.tbl",
+    ),
+    ("text_array_multi_slice", "SELECT id, tags[1:2][1:1] FROM map_subscript.tbl"),
 ]
 
 
@@ -128,6 +143,7 @@ def create_map_subscript_table(s3, pg_conn, superuser_conn, extension):
             tm map_type.key_text_val_int,
             im map_type.key_int_val_text,
             ints int[],
+            tags text[],
             pairs map_subscript.pair[],
             marr map_type.key_int_val_text[]
         )
@@ -139,12 +155,14 @@ def create_map_subscript_table(s3, pg_conn, superuser_conn, extension):
              ARRAY[('a', 10), ('b', 20)]::map_type.key_text_val_int,
              ARRAY[(5, 'five'), (1, 'one')]::map_type.key_int_val_text,
              ARRAY[1, 2, 3],
+             ARRAY['abc', 'def'],
              ARRAY[(1, 'x'), (2, 'y')]::map_subscript.pair[],
              ARRAY[ARRAY[(5, 'five'), (2, 'two')]::map_type.key_int_val_text]),
             (2,
              ARRAY[('c', 30)]::map_type.key_text_val_int,
              ARRAY[(4, 'four'), (7, 'seven')]::map_type.key_int_val_text,
              ARRAY[4, 5],
+             ARRAY['ghi'],
              ARRAY[(3, 'z')]::map_subscript.pair[],
              ARRAY[ARRAY[(2, 'two'), (9, 'nine')]::map_type.key_int_val_text]);
 

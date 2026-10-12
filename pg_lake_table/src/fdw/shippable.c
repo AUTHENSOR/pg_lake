@@ -776,12 +776,19 @@ is_non_shippable_udt_context(Node *node)
 	/*
 	 * The container type of a SubscriptingRef is the domain's base array
 	 * type, so look at refexpr to see whether we are subscripting a map.
+	 *
+	 * More than one subscript is not shippable either.  Postgres reads
+	 * a[i][j] as one subscript of a multidimensional array, so it is NULL for
+	 * the one-dimensional arrays we store.  DuckDB applies [j] to the element
+	 * a[i] instead: a key lookup for an array of maps, a field for an array
+	 * of composites and a character for text[].
 	 */
 	if (nodeType == T_SubscriptingRef)
 	{
 		SubscriptingRef *sbsref = (SubscriptingRef *) node;
 
-		return IsMapTypeOid(exprType((Node *) sbsref->refexpr));
+		return list_length(sbsref->refupperindexpr) > 1 ||
+			IsMapTypeOid(exprType((Node *) sbsref->refexpr));
 	}
 
 	/*
