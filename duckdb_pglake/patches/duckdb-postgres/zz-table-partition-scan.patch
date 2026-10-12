@@ -70,7 +70,7 @@ index 2b4157b..2049e6c 100644
  protected:
  	void LoadEntries(ClientContext &context, PostgresTransaction &transaction) override;
 diff --git a/src/postgres_scanner.cpp b/src/postgres_scanner.cpp
-index 3a71dca..724dac3 100644
+index b8b92b2..f0ac3e2 100644
 --- a/src/postgres_scanner.cpp
 +++ b/src/postgres_scanner.cpp
 @@ -40,13 +40,16 @@ struct PostgresLocalState : public LocalTableFunctionState {
@@ -132,7 +132,7 @@ index 3a71dca..724dac3 100644
  
  	PostgresScanFunction::PrepareBind(version, context, *bind_data, info->approx_num_pages);
  	return std::move(bind_data);
-@@ -237,7 +254,8 @@ static bool ContainsCastToVarchar(const PostgresType &type) {
+@@ -275,7 +292,8 @@ static string BuildVarcharCastProjection(const string &expr, const LogicalType &
  }
  
  static void PostgresInitInternal(ClientContext &context, const PostgresBindData *bind_data_p,
@@ -142,7 +142,7 @@ index 3a71dca..724dac3 100644
  	D_ASSERT(bind_data_p);
  	D_ASSERT(task_min <= task_max);
  
-@@ -249,7 +267,7 @@ static void PostgresInitInternal(ClientContext &context, const PostgresBindData
+@@ -287,7 +305,7 @@ static void PostgresInitInternal(ClientContext &context, const PostgresBindData
  			col_names += ", ";
  		}
  		if (column_id == COLUMN_IDENTIFIER_ROW_ID) {
@@ -151,16 +151,24 @@ index 3a71dca..724dac3 100644
  				// count(*) over postgres_query
  				col_names += "NULL";
  			} else {
-@@ -278,7 +296,7 @@ static void PostgresInitInternal(ClientContext &context, const PostgresBindData
- 				if (ContainsCastToVarchar(bind_data->postgres_types[column_id])) {
- 					throw NotImplementedException("Error reading table \"%s\" - cast to varchar not implemented for "
- 					                              "composite column \"%s\" (type %s)",
+@@ -317,14 +335,14 @@ static void PostgresInitInternal(ClientContext &context, const PostgresBindData
+ 					// binary value of the leaf to the varchar reader.
+ 					throw NotImplementedException("Error reading table \"%s\" - cast to varchar not implemented below "
+ 					                              "column \"%s\" (type %s)",
 -					                              bind_data->table_name, bind_data->names[column_id],
 +					                              target_table, bind_data->names[column_id],
  					                              bind_data->types[column_id].ToString());
  				}
- 			}
-@@ -292,7 +310,7 @@ static void PostgresInitInternal(ClientContext &context, const PostgresBindData
+ 			} else {
+ 				if (ContainsCastToVarchar(bind_data->postgres_types[column_id])) {
+ 					auto projection = BuildVarcharCastProjection(
+ 					    quoted_name, bind_data->types[column_id], bind_data->postgres_types[column_id],
+-					    bind_data->table_name, bind_data->names[column_id]);
++					    target_table, bind_data->names[column_id]);
+ 					// replace the plain column name appended above
+ 					col_names.resize(col_names.size() - quoted_name.size());
+ 					col_names += projection;
+@@ -340,7 +358,7 @@ static void PostgresInitInternal(ClientContext &context, const PostgresBindData
  
  	lstate.exec = false;
  	lstate.done = false;
@@ -169,7 +177,7 @@ index 3a71dca..724dac3 100644
  		filter = StringUtil::Format("WHERE ctid BETWEEN '(%d,0)'::tid AND '(%d,0)'::tid", task_min, task_max);
  	}
  	if (!filter_string.empty()) {
-@@ -304,15 +322,18 @@ static void PostgresInitInternal(ClientContext &context, const PostgresBindData
+@@ -352,15 +370,18 @@ static void PostgresInitInternal(ClientContext &context, const PostgresBindData
  		filter += filter_string;
  	}
  	string query;
@@ -191,7 +199,7 @@ index 3a71dca..724dac3 100644
  	}
  	if (!bind_data->use_text_protocol) {
  		query = StringUtil::Format(R"(COPY (%s) TO STDOUT (FORMAT "binary");)", query);
-@@ -411,6 +432,40 @@ static bool PostgresParallelStateNext(ClientContext &context, const FunctionData
+@@ -459,6 +480,41 @@ static bool PostgresParallelStateNext(ClientContext &context, const FunctionData
  
  	lock_guard<mutex> parallel_lock(gstate.lock);
  	lstate.batch_idx = gstate.batch_idx++;
@@ -201,6 +209,7 @@ index 3a71dca..724dac3 100644
 +			auto &partition_entry = bind_data->partitions[gstate.partition_idx];
 +			auto partition_pages = partition_entry.approx_num_pages;
 +
++			// branch partitions are not in the list; 0 pages is an empty leaf or a foreign table
 +			if (!bind_data->use_ctid_scan || partition_pages == 0) {
 +				gstate.partition_idx++;
 +				gstate.partition_page_idx = 0;
@@ -232,7 +241,7 @@ index 3a71dca..724dac3 100644
  	if (gstate.page_idx < bind_data->pages_approx) {
  		auto page_max = gstate.page_idx + bind_data->pages_per_task;
  		if (page_max >= bind_data->pages_approx || page_max > POSTGRES_TID_MAX) {
-@@ -418,7 +473,8 @@ static bool PostgresParallelStateNext(ClientContext &context, const FunctionData
+@@ -466,7 +522,8 @@ static bool PostgresParallelStateNext(ClientContext &context, const FunctionData
  			page_max = POSTGRES_TID_MAX;
  		}
  
@@ -242,7 +251,7 @@ index 3a71dca..724dac3 100644
  		gstate.page_idx = page_max;
  		return true;
  	}
-@@ -481,8 +537,9 @@ static unique_ptr<LocalTableFunctionState> GetLocalState(ClientContext &context,
+@@ -529,8 +586,9 @@ static unique_ptr<LocalTableFunctionState> GetLocalState(ClientContext &context,
  		local_state->no_connection = true;
  		return std::move(local_state);
  	}
@@ -254,17 +263,7 @@ index 3a71dca..724dac3 100644
  		lock_guard<mutex> parallel_lock(gstate.lock);
  		gstate.page_idx = POSTGRES_TID_MAX;
  	} else if (!PostgresParallelStateNext(context, input.bind_data.get(), *local_state, gstate)) {
-@@ -524,6 +581,9 @@ void PostgresLocalState::ScanChunk(ClientContext &context, const PostgresBindDat
- 		auto read_result = reader->Read(output);
- 		if (read_result == PostgresReadResult::FINISHED) {
- 			done = true;
-+			if (output.size() > 0) {
-+				return;
-+			}
- 			continue;
- 		}
- 		if (output.size() == STANDARD_VECTOR_SIZE || reader->ChunkSizeLimitReached()) {
-@@ -591,6 +651,13 @@ double PostgresScanProgress(ClientContext &context, const FunctionData *bind_dat
+@@ -642,6 +700,13 @@ double PostgresScanProgress(ClientContext &context, const FunctionData *bind_dat
  	auto &gstate = global_state->Cast<PostgresGlobalState>();
  
  	lock_guard<mutex> parallel_lock(gstate.lock);
