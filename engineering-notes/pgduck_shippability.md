@@ -17,6 +17,8 @@ These are PostgreSQL features that cannot be directly translated or executed in 
 - Lack of support for data types: Certain data types that PostgreSQL support are not supported in DuckDB. To see the full list, check `GetDuckDBTypeForPGType()` function in `pg_lake_engine/src/pgduck/type.c`
 - Lack of support for `avg(interval)` in DuckDB, indicating a direct incompatibility for this specific function.
 - The absence of the certain data type in DuckDB makes aggregates `min()` and `max()` non-shippable. The same restriction for `min`/`max` aggregates applies for the types for `oid`, `tid`, `pg_lsn`, `money`, `inet`, and `xid8`
+- Subscripts on map types (`m[i]`) are not pushed down: in PostgreSQL `m[i]` is the i-th (key, val) pair, while in DuckDB it is the value for key `i`. Key lookups through `map_type.extract()` or `->` are still pushed down.
+- Subscripts with more than one index (`a[i][j]`) are not pushed down: PostgreSQL reads them as one subscript of a multidimensional array, while DuckDB applies `[j]` to the element `a[i]` (a key lookup, a struct field or a character, depending on the element type).
 
 #### Functions
 - regexp_replace is only pushed down when using regexp_replace(text,text,text) or regexp_replace(text,text,text,text), other forms are not available.
