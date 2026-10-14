@@ -1000,8 +1000,8 @@ pg_lake_iceberg_validator(PG_FUNCTION_ARGS)
 			 * For other catalog types these options are not valid, except
 			 * that a writable REST catalog table carries the catalog prefix
 			 * CREATE TABLE resolved for it as catalog_name when it is not the
-			 * database name.  create_table.c rejects a user-supplied value
-			 * and alter_table.c refuses to change it.
+			 * database name. CREATE also accepts explicit prefixes for
+			 * replay, but alter_table.c refuses to change them.
 			 */
 			if (catalogName && icebergCatalogType != REST_CATALOG_READ_WRITE)
 				ereport(ERROR,

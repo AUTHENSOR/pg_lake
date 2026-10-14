@@ -322,16 +322,22 @@ AS SELECT region, sum(amount) AS total FROM orders GROUP BY region;
 ```
 
 pg_lake names the table in the catalog after the schema and table you used: here namespace
-`public` and table `order_summary`. The catalog (warehouse) is the server's `catalog_name`,
-else the prefix the catalog advertises, else the current database name. pg_lake picks it
+`public` and table `order_summary`. An explicit table `catalog_name` takes precedence;
+otherwise the catalog (warehouse) is the server's `catalog_name`, then the prefix the
+catalog advertises, then the current database name. pg_lake picks it
 once, when the table is created, and the table keeps it: changing the server's `catalog_name`
 later does not move existing tables, and the table's own `catalog_name` cannot be changed.
-A table in a catalog other than the database name has `catalog_name` in its options, and
-does not follow a database rename. pg_lake creates the namespace if it does not exist, and
-the catalog must allow writes under the server's `location_prefix`. The catalog options of
-attached tables are not accepted, so that the location of a table in the catalog cannot
-change after it was created. For the same reason, these tables cannot be renamed or moved to
-another schema. Tables in different catalogs cannot be changed in one transaction.
+A nondefault prefix is stored in the table's options. Explicit prefixes are always
+preserved, including when replaying `pg_dump` DDL, and do not follow a database rename.
+Tables without a stored prefix continue to use the database name. Writable tables do not
+accept `catalog_namespace` or `catalog_table_name` overrides and cannot be renamed or
+moved to another schema. One transaction may modify only one REST server and prefix;
+rolling back a savepoint discards its pending catalog work and restores the prior binding.
+
+pg_lake creates the namespace if it does not exist. Storage paths still use the PostgreSQL
+database name, not the REST prefix. The catalog must accept these paths under the server's
+`location_prefix`; catalog and namespace storage roots must match that layout. Prefix
+selection alone does not provide writable interoperability with every REST catalog.
 
 {: .warning }
 pg_lake sends its changes to the catalog after the PostgreSQL transaction commits. If the

@@ -960,12 +960,13 @@ ProcessCreateIcebergTableFromForeignTableStmt(ProcessUtilityParams * params)
 			/*
 			 * Writable tables derive catalog_namespace and catalog_table_name
 			 * from the schema and table name, and the catalog prefix from the
-			 * server (see ResolveWritableRestCatalogName below).  Explicit
-			 * catalog options on the table are rejected.
+			 * server unless catalog_name was supplied explicitly (including
+			 * by pg_dump). Namespace and table-name overrides remain
+			 * read-only.
 			 */
 			if (catalogNamespaceProvided != NULL ||
 				catalogTableNameProvided != NULL ||
-				catalogNameProvided != NULL)
+				(catalogNameProvided != NULL && !hasRestCatalogOption))
 			{
 				ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 								errmsg("writable %s catalog iceberg tables do not "
@@ -977,16 +978,23 @@ ProcessCreateIcebergTableFromForeignTableStmt(ProcessUtilityParams * params)
 				char	   *catalogOptionValue = GetStringOption(createStmt->options, "catalog", false);
 				RestCatalogOptions *opts =
 					ResolveRestCatalogOptions(catalogOptionValue);
-				char	   *writableCatalogName = ResolveWritableRestCatalogName(opts);
+				char	   *writableCatalogName = catalogNameProvided != NULL ?
+					catalogNameProvided : ResolveWritableRestCatalogName(opts);
+
+				if (writableCatalogName[0] == '\0')
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("catalog_name must not be empty")));
 
 				/*
 				 * Store the prefix only when it is not the database name, so
 				 * tables on the default prefix behave exactly as before
-				 * (including following a database rename).  This is appended
-				 * after the explicit-options check above, which only looks at
-				 * what the user wrote.
+				 * (including following a database rename). Explicit prefixes,
+				 * including those replayed from pg_dump, are preserved as
+				 * given.
 				 */
-				if (strcmp(writableCatalogName, get_database_name(MyDatabaseId)) != 0)
+				if (catalogNameProvided == NULL &&
+					strcmp(writableCatalogName, get_database_name(MyDatabaseId)) != 0)
 					createStmt->options =
 						lappend(createStmt->options,
 								makeDefElem("catalog_name",
@@ -1191,6 +1199,12 @@ ProcessCreateIcebergTableFromForeignTableStmt(ProcessUtilityParams * params)
 	{
 		/* here we only deal with writable rest catalog iceberg tables */
 		Assert(!HasReadOnlyOption(createStmt->options));
+
+		/*
+		 * Reject a conflicting transaction target before namespace or staging
+		 * calls.
+		 */
+		BindRelationToXactRestCatalog(relationId);
 
 		/*
 		 * For writable rest catalog iceberg tables, we register the namespace

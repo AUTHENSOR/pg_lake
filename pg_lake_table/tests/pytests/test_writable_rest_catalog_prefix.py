@@ -1,8 +1,8 @@
 """
 Writable REST catalog tables and their catalog prefix (#690).
 
-A writable table resolves its REST prefix once, at CREATE TABLE: the server's
-catalog_name, else the prefix the catalog advertises on /v1/config, else the
+A writable table resolves its REST prefix once, at CREATE TABLE: an explicit
+table catalog_name, else the server's catalog_name, else /v1/config, else the
 database name.  A prefix other than the database name is stored as the
 table's catalog_name option and cannot be changed afterwards, so a later
 ALTER SERVER never re-routes an existing table.
@@ -14,10 +14,12 @@ prefix pg_lake sent each call under.
 import json
 import re
 import socket
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
+import psycopg2
 from utils_pytest import *
 
 
@@ -36,6 +38,7 @@ class _MockCatalog:
             "error": {"message": "Please specify a warehouse", "code": 400}
         }
         self.requests = []  # (method, path)
+        self.bodies = []
         mock = self
 
         class _Handler(BaseHTTPRequestHandler):
@@ -52,8 +55,8 @@ class _MockCatalog:
             def _handle(self):
                 mock.requests.append((self.command, self.path))
                 length = int(self.headers.get("Content-Length") or 0)
-                if length:
-                    self.rfile.read(length)
+                body = self.rfile.read(length) if length else b""
+                mock.bodies.append(json.loads(body) if body else None)
 
                 path = self.path.split("?", 1)[0]
 
@@ -82,7 +85,8 @@ class _MockCatalog:
 
         self.port = _find_free_port()
         self.httpd = HTTPServer(("127.0.0.1", self.port), _Handler)
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
 
     @property
     def endpoint(self):
@@ -99,6 +103,8 @@ class _MockCatalog:
 
     def shutdown(self):
         self.httpd.shutdown()
+        self.thread.join(timeout=5)
+        self.httpd.server_close()
 
 
 @pytest.fixture
@@ -150,7 +156,8 @@ def _table_option(conn, table, option):
 
 
 @pytest.fixture
-def writable_schema(superuser_conn, s3, extension):
+def writable_schema(superuser_conn, s3, extension, mock_catalog):
+    # Keep the mock alive until DROP TABLE's post-commit HTTP requests finish.
     run_command(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE", superuser_conn)
     run_command(f"CREATE SCHEMA {SCHEMA}", superuser_conn)
     superuser_conn.commit()
@@ -167,11 +174,22 @@ def test_server_catalog_name_is_used_and_stored(
     installcheck, superuser_conn, writable_schema, mock_catalog
 ):
     if installcheck:
-        return
+        pytest.skip("Requires an isolated test cluster")
 
     mock = mock_catalog()
     writable_schema.append("wp_server_catname")
     _create_server(superuser_conn, "wp_server_catname", mock.endpoint, "sales")
+
+    before = len(mock.requests)
+    err = run_command(
+        f"CREATE TABLE {SCHEMA}.empty_prefix (a int) USING iceberg "
+        "WITH (catalog='wp_server_catname', catalog_name='')",
+        superuser_conn,
+        raise_error=False,
+    )
+    assert "catalog_name must not be empty" in str(err), err
+    assert mock.requests[before:] == []
+    superuser_conn.rollback()
 
     run_command(
         f"CREATE TABLE {SCHEMA}.t (a int) USING iceberg "
@@ -190,7 +208,7 @@ def test_advertised_prefix_is_used_and_stored(
     installcheck, superuser_conn, writable_schema, mock_catalog
 ):
     if installcheck:
-        return
+        pytest.skip("Requires an isolated test cluster")
 
     warehouse_id = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
     mock = mock_catalog(
@@ -215,7 +233,7 @@ def test_falls_back_to_database_name_without_storing_it(
 ):
     """A catalog that rejects /v1/config keeps today's database-name prefix."""
     if installcheck:
-        return
+        pytest.skip("Requires an isolated test cluster")
 
     mock = mock_catalog(config_status=400)
     writable_schema.append("wp_fallback")
@@ -237,7 +255,7 @@ def test_alter_server_does_not_reroute_and_catalog_name_is_locked(
     installcheck, superuser_conn, writable_schema, mock_catalog
 ):
     if installcheck:
-        return
+        pytest.skip("Requires an isolated test cluster")
 
     mock = mock_catalog()
     writable_schema.append("wp_locked")
@@ -268,15 +286,15 @@ def test_alter_server_does_not_reroute_and_catalog_name_is_locked(
         assert err is not None and 'Changing option "catalog_name"' in str(err), err
         superuser_conn.rollback()
 
-    # a user still cannot pick the prefix on the table itself
-    err = run_command(
+    # pg_dump emits the stored prefix; accepting it at CREATE must not weaken
+    # the ALTER guard or make restored tables inherit changed server defaults.
+    run_command(
         f"CREATE TABLE {SCHEMA}.t2 (a int) USING iceberg "
-        "WITH (catalog = 'wp_locked', catalog_name = 'mine')",
+        "WITH (catalog = 'wp_locked', catalog_name = 'first')",
         superuser_conn,
-        raise_error=False,
     )
-    assert err is not None and "do not allow explicit catalog options" in str(err), err
-    superuser_conn.rollback()
+    superuser_conn.commit()
+    assert _table_option(superuser_conn, "t2", "catalog_name") == "first"
 
 
 def test_mixed_prefixes_in_one_transaction_are_rejected(
@@ -289,7 +307,7 @@ def test_mixed_prefixes_in_one_transaction_are_rejected(
     request is sent.
     """
     if installcheck:
-        return
+        pytest.skip("Requires an isolated test cluster")
 
     mock = mock_catalog()
     writable_schema.append("wp_mixed")
@@ -326,3 +344,216 @@ def test_mixed_prefixes_in_one_transaction_are_rejected(
     superuser_conn.commit()
     run_command(f"DROP TABLE {SCHEMA}.t2", superuser_conn)
     superuser_conn.commit()
+
+
+def test_mixed_prefix_create_rejected_before_staging(
+    installcheck, superuser_conn, writable_schema, mock_catalog
+):
+    if installcheck:
+        pytest.skip("Requires an isolated test cluster")
+    mock = mock_catalog()
+    writable_schema.append("wp_early")
+    _create_server(superuser_conn, "wp_early", mock.endpoint, "first")
+    run_command(
+        f"CREATE TABLE {SCHEMA}.t1 (a int) USING iceberg WITH (catalog='wp_early')",
+        superuser_conn,
+    )
+    sent_before = len(mock.requests)
+    err = run_command(
+        f"CREATE TABLE {SCHEMA}.t2 (a int) USING iceberg "
+        "WITH (catalog='wp_early', catalog_name='second')",
+        superuser_conn,
+        raise_error=False,
+    )
+    assert "different REST catalog prefixes" in str(err), err
+    assert mock.requests[sent_before:] == []
+    superuser_conn.rollback()
+
+
+def test_savepoint_rollback_restores_prefix_and_requests(
+    installcheck, superuser_conn, writable_schema, mock_catalog
+):
+    if installcheck:
+        pytest.skip("Requires an isolated test cluster")
+    mock = mock_catalog()
+    writable_schema.append("wp_savepoint")
+    _create_server(superuser_conn, "wp_savepoint", mock.endpoint, "first")
+    run_command("SAVEPOINT before_first", superuser_conn)
+    run_command(
+        f"CREATE TABLE {SCHEMA}.rolled_back (a int) USING iceberg "
+        "WITH (catalog='wp_savepoint')",
+        superuser_conn,
+    )
+    run_command("ROLLBACK TO SAVEPOINT before_first", superuser_conn)
+    sent_before = len(mock.requests)
+    run_command(
+        f"CREATE TABLE {SCHEMA}.kept (a int) USING iceberg "
+        "WITH (catalog='wp_savepoint', catalog_name='second')",
+        superuser_conn,
+    )
+    superuser_conn.commit()
+    assert all("/first/" not in path for _, path in mock.requests[sent_before:])
+    assert _table_option(superuser_conn, "kept", "catalog_name") == "second"
+
+
+def test_released_savepoint_preserves_parent_binding(
+    installcheck, superuser_conn, writable_schema, mock_catalog
+):
+    if installcheck:
+        pytest.skip("Requires an isolated test cluster")
+    mock = mock_catalog()
+    writable_schema.append("wp_release")
+    _create_server(superuser_conn, "wp_release", mock.endpoint, "first")
+    run_command("SAVEPOINT parent", superuser_conn)
+    run_command("SAVEPOINT child", superuser_conn)
+    run_command(
+        f"CREATE TABLE {SCHEMA}.t (a int) USING iceberg WITH (catalog='wp_release')",
+        superuser_conn,
+    )
+    run_command("RELEASE SAVEPOINT child", superuser_conn)
+    run_command("SAVEPOINT conflicting", superuser_conn)
+    err = run_command(
+        f"CREATE TABLE {SCHEMA}.bad (a int) USING iceberg "
+        "WITH (catalog='wp_release', catalog_name='second')",
+        superuser_conn,
+        raise_error=False,
+    )
+    assert "different REST catalog prefixes" in str(err), err
+    run_command("ROLLBACK TO SAVEPOINT conflicting", superuser_conn)
+    run_command("ROLLBACK TO SAVEPOINT parent", superuser_conn)
+    sent_before = len(mock.requests)
+    run_command(
+        f"CREATE TABLE {SCHEMA}.kept (a int) USING iceberg "
+        "WITH (catalog='wp_release', catalog_name='second')",
+        superuser_conn,
+    )
+    superuser_conn.commit()
+    assert all("/first/" not in path for _, path in mock.requests[sent_before:])
+
+
+def test_savepoint_rollback_preserves_parent_create(
+    installcheck, superuser_conn, writable_schema, mock_catalog
+):
+    if installcheck:
+        pytest.skip("Requires an isolated test cluster")
+    mock = mock_catalog()
+    writable_schema.append("wp_parent")
+    _create_server(superuser_conn, "wp_parent", mock.endpoint, "first")
+    run_command(
+        f"CREATE TABLE {SCHEMA}.kept (a int) USING iceberg WITH (catalog='wp_parent')",
+        superuser_conn,
+    )
+    run_command("SAVEPOINT child", superuser_conn)
+    run_command(f"DROP TABLE {SCHEMA}.kept", superuser_conn)
+    run_command(
+        f"CREATE TABLE {SCHEMA}.discarded (a int) USING iceberg WITH (catalog='wp_parent')",
+        superuser_conn,
+    )
+    run_command("ROLLBACK TO child", superuser_conn)
+    sent_before = len(mock.requests)
+    superuser_conn.commit()
+    requests = mock.requests[sent_before:]
+    assert ("POST", f"/v1/first/namespaces/{SCHEMA}/tables/kept") in requests
+    assert not any(
+        method == "DELETE" or "discarded" in path for method, path in requests
+    )
+
+
+def test_first_write_inside_fresh_session_savepoint(
+    installcheck, superuser_conn, writable_schema, mock_catalog
+):
+    if installcheck:
+        pytest.skip("Requires an isolated test cluster")
+    mock = mock_catalog()
+    writable_schema.append("wp_fresh")
+    _create_server(superuser_conn, "wp_fresh", mock.endpoint, "first")
+    conn = psycopg2.connect(superuser_conn.dsn)
+    try:
+        run_command("SAVEPOINT outer_savepoint", conn)
+        run_command("SAVEPOINT inner_savepoint", conn)
+        run_command(
+            f"CREATE TABLE {SCHEMA}.discarded (a int) USING iceberg WITH (catalog='wp_fresh')",
+            conn,
+        )
+        run_command("RELEASE inner_savepoint", conn)
+        run_command("ROLLBACK TO outer_savepoint", conn)
+        sent_before = len(mock.requests)
+        run_command(
+            f"CREATE TABLE {SCHEMA}.kept (a int) USING iceberg "
+            "WITH (catalog='wp_fresh', catalog_name='second')",
+            conn,
+        )
+        conn.commit()
+        assert all("/first/" not in path for _, path in mock.requests[sent_before:])
+    finally:
+        conn.close()
+
+
+def test_dumped_prefix_can_be_replayed_after_server_change(
+    installcheck, superuser_conn, writable_schema, mock_catalog
+):
+    if installcheck:
+        pytest.skip("Requires an isolated test cluster")
+    mock = mock_catalog()
+    writable_schema.append("wp_dump")
+    _create_server(superuser_conn, "wp_dump", mock.endpoint, "first")
+    run_command(
+        f"CREATE TABLE {SCHEMA}.dumped (a int) USING iceberg WITH (catalog='wp_dump')",
+        superuser_conn,
+    )
+    superuser_conn.commit()
+    dump = subprocess.check_output(
+        [
+            "pg_dump",
+            "--dbname",
+            superuser_conn.dsn,
+            "--schema-only",
+            "--table",
+            f"{SCHEMA}.dumped",
+        ],
+        text=True,
+    )
+    ddl = re.search(r"CREATE FOREIGN TABLE .*?;", dump, re.DOTALL).group(0)
+    assert "catalog_name 'first'" in ddl
+    # Test catalog identity replay, not restoring existing data files.
+    ddl, replaced = re.subn(r"location '([^']+)'", r"location '\1/replay'", ddl)
+    assert replaced == 1
+    run_command(f"DROP TABLE {SCHEMA}.dumped", superuser_conn)
+    superuser_conn.commit()
+    run_command(
+        "ALTER SERVER wp_dump OPTIONS (SET catalog_name 'second')", superuser_conn
+    )
+    superuser_conn.commit()
+    sent_before = len(mock.requests)
+    run_command(ddl, superuser_conn)
+    superuser_conn.commit()
+    assert _table_option(superuser_conn, "dumped", "catalog_name") == "first"
+    assert all("/second/" not in path for _, path in mock.requests[sent_before:])
+
+
+def test_mixed_prefix_alter_rejected_at_statement_time(
+    installcheck, superuser_conn, writable_schema, mock_catalog
+):
+    if installcheck:
+        pytest.skip("Requires an isolated test cluster")
+    mock = mock_catalog()
+    writable_schema.append("wp_alter")
+    _create_server(superuser_conn, "wp_alter", mock.endpoint, "first")
+    for table, prefix in (("t1", "first"), ("t2", "second")):
+        run_command(
+            f"CREATE TABLE {SCHEMA}.{table} (a int) USING iceberg "
+            f"WITH (catalog='wp_alter', catalog_name='{prefix}')",
+            superuser_conn,
+        )
+        superuser_conn.commit()
+    sent_before = len(mock.requests)
+    run_command(f"ALTER TABLE {SCHEMA}.t1 ADD COLUMN b int", superuser_conn)
+    err = run_command(
+        f"ALTER TABLE {SCHEMA}.t2 ADD COLUMN b int", superuser_conn, raise_error=False
+    )
+    assert "different REST catalog prefixes" in str(err), err
+    assert mock.requests[sent_before:] == []
+    superuser_conn.rollback()
+    for table in ("t1", "t2"):
+        run_command(f"DROP TABLE {SCHEMA}.{table}", superuser_conn)
+        superuser_conn.commit()
