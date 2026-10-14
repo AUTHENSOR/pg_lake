@@ -21,6 +21,7 @@
 
 #include "pg_lake/extensions/pg_lake_iceberg.h"
 #include "pg_lake/iceberg/catalog.h"
+#include "pg_lake/iceberg/external_catalog_cache.h"
 #include "pg_lake/object_store_catalog/object_store_catalog.h"
 #include "pg_lake/rest_catalog/rest_catalog.h"
 #include "pg_lake/util/rel_utils.h"
@@ -28,7 +29,6 @@
 #include "pg_extension_base/spi_helpers.h"
 #include "catalog/namespace.h"
 #include "commands/dbcommands.h"
-#include "common/hashfn.h"
 #include "foreign/foreign.h"
 #include "utils/lsyscache.h"
 #include "utils/guc.h"
@@ -39,31 +39,10 @@
 char	   *IcebergDefaultLocationPrefix = NULL;
 char	   *IcebergDefaultCatalog = POSTGRES_CATALOG_NAME;
 
-
-/*
-* Within a transaction, we may refrain to fetch the external catalog metadata
-* multiple times for the same table. So we cache them here.
-*/
-typedef struct ExternalCatalogEntry
-{
-	Oid			relationId;
-
-	/*
-	 * In read-committed mode, we should only use the cached value for the
-	 * same command, new commands in the same transaction should see the
-	 * latest committed value.
-	 */
-	TimestampTz statementStartTimestamp;
-	char	   *metadataLocation;
-}			ExternalCatalogEntry;
-
-static HTAB *ExternalCatalogMetadataPerTxHash = NULL;
-
-
 static char *GetIcebergExternalMetadataLocation(Oid relationId);
 static char *GetIcebergCatalogMetadataLocation(Oid relationId, bool forUpdate);
-static char *AddOrGetIcebergExternalMetadataLocationFromCache(Oid relationId, IcebergCatalogType icebergCatalogType);
-static void InitializeExternalCatalogMetadataPerTxHashIfNeeded(void);
+static char *ResolveIcebergExternalMetadataLocation(Oid relationId,
+													IcebergCatalogType icebergCatalogType);
 static char *GetIcebergCatalogMetadataLocationInternal(Oid relationId, bool isPrevMetadata, bool forUpdate);
 static char *GetIcebergCatalogColumnInternal(Oid relationId, char *columnName, bool forUpdate, bool errorIfNotFound);
 static void ErrorIfSameTableExistsInExternalCatalog(Oid relationId);
@@ -361,6 +340,14 @@ GetIcebergMetadataLocation(Oid relationId, bool forUpdate)
 			LockIcebergPgLakeCatalogForUpdate(relationId);
 		}
 
+		/*
+		 * forUpdate has done its work above, by taking the row lock that
+		 * serializes writers. It does not change how the external catalog is
+		 * resolved: the path that publishes a new location for a writable
+		 * REST catalog table reads that catalog directly, through
+		 * GetWritableRestCatalogTableMetadata(), and the callers that arrive
+		 * here are reading.
+		 */
 		return GetIcebergExternalMetadataLocation(relationId);
 	}
 	else
@@ -439,7 +426,8 @@ GetIcebergExternalMetadataLocation(Oid relationId)
 		icebergCatalogType == REST_CATALOG_READ_ONLY ||
 		icebergCatalogType == REST_CATALOG_READ_WRITE)
 	{
-		currentMetadataPath = AddOrGetIcebergExternalMetadataLocationFromCache(relationId, icebergCatalogType);
+		currentMetadataPath = ResolveIcebergExternalMetadataLocation(relationId,
+																	 icebergCatalogType);
 	}
 	else if (icebergCatalogType == NONE_CATALOG && tableProperties.tableType == PG_LAKE_TABLE_TYPE && tableProperties.format == DATA_FORMAT_ICEBERG)
 	{
@@ -458,63 +446,35 @@ GetIcebergExternalMetadataLocation(Oid relationId)
 
 
 /*
-* AddOrGetIcebergExternalMetadataLocationFromCache adds or gets the metadata location
-* for an external iceberg table from the per-transaction cache.
-*/
+ * ResolveIcebergExternalMetadataLocation returns the current metadata
+ * location of a table in an external catalog.
+ *
+ * A REST catalog is asked for one table at a time, so the location it
+ * answered with is held per relation and reused for as long as the reader
+ * is entitled to it. An object store catalog publishes all of its tables
+ * as a single document, and holding that document is what keeps the tables
+ * of one catalog at one version of it, so there is nothing left to hold
+ * per relation here. See external_catalog_cache.c.
+ */
 static char *
-AddOrGetIcebergExternalMetadataLocationFromCache(Oid relationId, IcebergCatalogType icebergCatalogType)
+ResolveIcebergExternalMetadataLocation(Oid relationId,
+									   IcebergCatalogType icebergCatalogType)
 {
-	char	   *currentMetadataPath = NULL;
+	if (icebergCatalogType == OBJECT_STORE_READ_ONLY)
+		return GetMetadataLocationFromExternalObjectStoreCatalogForTable(relationId);
 
-	InitializeExternalCatalogMetadataPerTxHashIfNeeded();
+	Assert(icebergCatalogType == REST_CATALOG_READ_ONLY ||
+		   icebergCatalogType == REST_CATALOG_READ_WRITE);
 
-	bool		found = false;
-	ExternalCatalogEntry *entry =
-		(ExternalCatalogEntry *) hash_search(ExternalCatalogMetadataPerTxHash,
-											 &relationId, HASH_FIND, &found);
+	char	   *cachedLocation = GetCachedExternalMetadataLocation(relationId);
 
-	if (found && entry->statementStartTimestamp == GetCurrentStatementStartTimestamp())
-	{
-		/*
-		 * While executing the same command, we should always use the same
-		 * location.
-		 */
-		currentMetadataPath = entry->metadataLocation;
-	}
-	else if (found && IsolationUsesXactSnapshot())
-	{
-		/*
-		 * In REPEATABLE READ and SERIALIZABLE modes, we should always use the
-		 * same location within the transaction.
-		 */
-		currentMetadataPath = entry->metadataLocation;
-	}
-	else
-	{
-		/*
-		 * Either first time fetching the metadata location for this relation
-		 * in this transaction, or we are in read-committed mode and a new
-		 * command is issued, so we need to fetch the latest metadata
-		 * location.
-		 */
-		if (icebergCatalogType == REST_CATALOG_READ_ONLY ||
-			icebergCatalogType == REST_CATALOG_READ_WRITE)
-			currentMetadataPath = GetMetadataLocationForRestCatalogForIcebergTable(relationId);
-		else if (icebergCatalogType == OBJECT_STORE_READ_ONLY)
-			currentMetadataPath = GetMetadataLocationFromExternalObjectStoreCatalogForTable(relationId);
-		else
-			pg_unreachable();
+	if (cachedLocation != NULL)
+		return cachedLocation;
 
-		MemoryContext currentContext = MemoryContextSwitchTo(TopTransactionContext);
+	char	   *currentMetadataPath =
+		GetMetadataLocationForRestCatalogForIcebergTable(relationId);
 
-		entry = (ExternalCatalogEntry *) hash_search(ExternalCatalogMetadataPerTxHash,
-													 (void *) &relationId,
-													 HASH_ENTER, &found);
-		entry->relationId = relationId;
-		entry->statementStartTimestamp = GetCurrentStatementStartTimestamp();
-		entry->metadataLocation = pstrdup(currentMetadataPath);
-		MemoryContextSwitchTo(currentContext);
-	}
+	CacheExternalMetadataLocation(relationId, currentMetadataPath);
 
 	return currentMetadataPath;
 }
@@ -784,37 +744,4 @@ bool
 IsReadOnlyIcebergTable(Oid relationId)
 {
 	return IsIcebergTable(relationId) && !IsWritableIcebergTable(relationId);
-}
-
-
-static void
-InitializeExternalCatalogMetadataPerTxHashIfNeeded(void)
-{
-	if (ExternalCatalogMetadataPerTxHash == NULL)
-	{
-		HASHCTL		ctl;
-
-		MemSet(&ctl, 0, sizeof(ctl));
-		ctl.keysize = sizeof(Oid);
-		ctl.entrysize = sizeof(ExternalCatalogEntry);
-		ctl.hash = oid_hash;
-		ctl.hcxt = TopTransactionContext;
-
-		ExternalCatalogMetadataPerTxHash =
-			hash_create("Tracked External Catalog Metadata Paths",
-						32, &ctl,
-						HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
-	}
-
-}
-
-
-/*
-* ResetExternalCatalogMetadataPerTxHash resets the ExternalCatalogMetadataPerTxHash
-* hash table at the end of the transaction.
-*/
-void
-ResetExternalCatalogMetadataPerTxHash(void)
-{
-	ExternalCatalogMetadataPerTxHash = NULL;
 }

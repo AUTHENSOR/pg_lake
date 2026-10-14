@@ -14,6 +14,7 @@
 
 #include "pg_lake/json/json_utils.h"
 #include "pg_lake/iceberg/catalog.h"
+#include "pg_lake/iceberg/external_catalog_cache.h"
 #include "pg_lake/object_store_catalog/object_store_catalog.h"
 #include "pg_lake/rest_catalog/rest_catalog.h"
 #include "pg_lake/copy/copy_format.h"
@@ -58,6 +59,7 @@ static bool CatalogNeedsExport(void);
 static void PushMetadataLocationToObjectStoreCatalog(void);
 static void TrackInvalidateCatalogExport(Datum argument, Oid relationId);
 static char *GetExternalObjectStoreCatalogFilePath(const char *catalogName);
+static char *GetExternalObjectStoreCatalogContent(const char *catalogPath);
 static char *GetInternalObjectStoreCatalogFilePath(const char *catalogName);
 static bool CheckIfExternalObjectStoreCatalogExists(const char *catalogName);
 static void GetObjectStoreCatalogInfoFromCatalog(Oid relationId, char **catalogName, char **catalogNamespace, char **catalogTableName);
@@ -93,7 +95,12 @@ list_object_store_tables(PG_FUNCTION_ARGS)
 		GetInternalObjectStoreCatalogFilePath(catalogName) :
 		GetExternalObjectStoreCatalogFilePath(catalogName);
 
-	/* catalog.json is a fixed path that may change out of band; read fresh. */
+	/*
+	 * catalog.json is a fixed path that may change out of band; read fresh.
+	 * This one reports what the catalog holds now rather than what the reader
+	 * is entitled to read, so it does not go through the per statement cache
+	 * the table resolution path uses.
+	 */
 	char	   *catalogContent = GetJsonFromURINoCache(catalogPath);
 
 	StringInfo	getObjectStoreTables = makeStringInfo();
@@ -490,8 +497,7 @@ GetTableMetadataLocationFromExternalObjectStoreCatalog(const char *catalogName, 
 	const char *catalogPath =
 		GetExternalObjectStoreCatalogFilePath(catalogName);
 
-	/* catalog.json is a fixed path that may change out of band; read fresh. */
-	char	   *catalogContent = GetJsonFromURINoCache(catalogPath);
+	char	   *catalogContent = GetExternalObjectStoreCatalogContent(catalogPath);
 
 	StringInfo	metadataLocationStrInfo = makeStringInfo();
 	StringInfo	getMetadataLocation = makeStringInfo();
@@ -549,6 +555,32 @@ GetTableMetadataLocationFromExternalObjectStoreCatalog(const char *catalogName, 
 	return metadataLocationStrInfo->data;
 }
 
+
+
+/*
+ * GetExternalObjectStoreCatalogContent returns the document that lists the
+ * tables of the given catalog.
+ *
+ * The document sits at a fixed path and whoever owns the catalog replaces
+ * it in place, so it is read without the file cache in the way. It is then
+ * held for as long as the reader is entitled to one version of the
+ * catalog, which is what makes every table a statement resolves from this
+ * catalog come from the same version of it. See external_catalog_cache.c.
+ */
+static char *
+GetExternalObjectStoreCatalogContent(const char *catalogPath)
+{
+	char	   *catalogContent = GetCachedExternalCatalogDocument(catalogPath);
+
+	if (catalogContent != NULL)
+		return catalogContent;
+
+	catalogContent = GetJsonFromURINoCache(catalogPath);
+
+	CacheExternalCatalogDocument(catalogPath, catalogContent);
+
+	return catalogContent;
+}
 
 
 /*

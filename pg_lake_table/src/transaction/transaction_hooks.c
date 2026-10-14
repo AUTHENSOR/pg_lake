@@ -22,7 +22,6 @@
 
 #include "pg_lake/transaction/track_iceberg_metadata_changes.h"
 #include "pg_lake/transaction/transaction_hooks.h"
-#include "pg_lake/iceberg/catalog.h"
 
 
 static void IcebergXactCallback(XactEvent event, void *arg);
@@ -66,7 +65,6 @@ IcebergXactCallback(XactEvent event, void *arg)
 			{
 				ResetTrackedIcebergMetadataOperation();
 				ResetRestCatalogRequests();
-				ResetExternalCatalogMetadataPerTxHash();
 				break;
 			}
 		case XACT_EVENT_PRE_PREPARE:
@@ -84,7 +82,6 @@ IcebergXactCallback(XactEvent event, void *arg)
 			{
 				PostAllRestCatalogRequests();
 				ResetRestCatalogRequests();
-				ResetExternalCatalogMetadataPerTxHash();
 				break;
 			}
 	}

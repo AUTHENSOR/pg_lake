@@ -386,10 +386,6 @@ def test_register_existing_table(
     )
     iceberg_table.append(data)
 
-    # make sure to get new metadata location
-    # in a new tx
-    pg_conn.commit()
-
     # make sure we can follow the changes
     if set_search_path:
         res = run_query(
@@ -415,10 +411,6 @@ def test_register_existing_table(
         [{"city": "city_5", f"""lat lat""": 99.0, "long": 88.0}]
     )
     iceberg_table.overwrite(updated, overwrite_filter=EqualTo("city", "city_5"))
-
-    # make sure to get new metadata location
-    # in a new tx
-    pg_conn.commit()
 
     # make sure we can follow the changes
     res = run_query(
@@ -637,7 +629,6 @@ def test_register_existing_table_renames(
         pg_conn,
     )
     assert len(res) == 5
-    pg_conn.commit()
 
     rename_rest_catalog_table(
         pg_conn,
@@ -703,6 +694,7 @@ def test_register_existing_table_renames(
 
 def test_metadata_fetch(
     pg_conn,
+    superuser_conn,
     set_polaris_gucs,
     with_default_location,
     s3,
@@ -734,9 +726,11 @@ def test_metadata_fetch(
     )
     pg_conn.commit()
 
-    # Clear any existing notices
-    pg_conn.notices.clear()
-    run_command("set pg_lake_iceberg.http_client_trace_traffic to true", pg_conn)
+    # the trace reports catalog traffic to the client, so it is restricted to
+    # superusers; the reads below have to run on the connection that has it on,
+    # because the notices arrive on the session that made the requests
+    superuser_conn.notices.clear()
+    run_command("set pg_lake_iceberg.http_client_trace_traffic to true", superuser_conn)
 
     # running multiple commands in read-committed mode fetches metadata only once per statement
     stmt_cnt = 3
@@ -745,11 +739,11 @@ def test_metadata_fetch(
             f"""
                 SELECT * FROM "{catalog_namespace_name}_pg"."{catalog_namespace_name}_pg";
                  """,
-            pg_conn,
+            superuser_conn,
         )
 
     fetch_cnt = 0
-    for line in pg_conn.notices:
+    for line in superuser_conn.notices:
         print(line)
         if "making GET request to URL" in str(
             line
@@ -758,15 +752,24 @@ def test_metadata_fetch(
 
     # we executed 3 statements
     assert fetch_cnt == stmt_cnt
-    pg_conn.commit()
+    superuser_conn.commit()
 
     # now, the same test with REPEATABLE READ and SERIALIZABLE
     tx_mode = ["REPEATABLE READ", "SERIALIZABLE"]
-    for m in tx_mode:
+    for isolation_level in tx_mode:
 
-        pg_conn.notices.clear()
+        superuser_conn.notices.clear()
 
-        run_command(f"BEGIN TRANSACTION ISOLATION LEVEL {m}", pg_conn)
+        # the driver has already opened the transaction, so this is the way to
+        # set its isolation level; assert it took, or the test would pass for
+        # the wrong reason at READ COMMITTED
+        run_command(
+            f"SET TRANSACTION ISOLATION LEVEL {isolation_level}", superuser_conn
+        )
+        assert (
+            run_query("show transaction_isolation", superuser_conn)[0][0]
+            == isolation_level.lower()
+        )
 
         stmt_cnt = 3
         for _ in range(0, stmt_cnt):
@@ -774,11 +777,11 @@ def test_metadata_fetch(
                 f"""
                     SELECT * FROM "{catalog_namespace_name}_pg"."{catalog_namespace_name}_pg";
                      """,
-                pg_conn,
+                superuser_conn,
             )
 
         fetch_cnt = 0
-        for line in pg_conn.notices:
+        for line in superuser_conn.notices:
             print(line)
             if "making GET request to URL" in str(
                 line
@@ -788,11 +791,13 @@ def test_metadata_fetch(
         # we executed 3 statements but only fetch once given
         # the isolation levels
         assert fetch_cnt == 1
-        pg_conn.commit()
+        superuser_conn.commit()
+
+    run_command("reset pg_lake_iceberg.http_client_trace_traffic", superuser_conn)
+    superuser_conn.commit()
 
     run_command(f"""DROP SCHEMA "{catalog_namespace_name}_pg" CASCADE""", pg_conn)
     pg_conn.commit()
-    run_command("reset pg_lake_iceberg.http_client_trace_traffic", pg_conn)
     nuke_rest_catalog(rest_catalog, catalog_namespace_name)
 
 
