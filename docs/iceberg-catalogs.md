@@ -194,7 +194,7 @@ CREATE SERVER polaris TYPE 'rest'
 |:--|:--|:--|
 | `rest_endpoint` | server | Base URL of the REST catalog API. |
 | `location_prefix` | server | Storage location for tables pg_lake creates in this catalog. pg_lake adds the database, schema and table name to it. |
-| `catalog_name` | server | Catalog (warehouse) to attach existing tables from. Without it, pg_lake uses the prefix the catalog advertises, or the database name. A server with `catalog_name` can only be used to attach tables, see [below](#create-tables-in-an-external-catalog). |
+| `catalog_name` | server | Catalog (warehouse) that tables use. Without it, pg_lake uses the prefix the catalog advertises, or the database name. A table created by pg_lake keeps the catalog it was created in, even if this option changes later, see [below](#create-tables-in-an-external-catalog). |
 | `oauth_endpoint` | server | OAuth2 token endpoint URL, if the catalog does not serve it at `<rest_endpoint>/v1/oauth/tokens`. |
 | `enable_vended_credentials` | server | Ask the catalog for temporary storage credentials instead of using pgduck_server's own. |
 | `scope` | server or user mapping | OAuth2 scope. Default `PRINCIPAL_ROLE:ALL`. The user mapping wins if both set it. |
@@ -321,13 +321,17 @@ WITH (catalog = 'polaris')
 AS SELECT region, sum(amount) AS total FROM orders GROUP BY region;
 ```
 
-pg_lake names the table in the catalog after the database, schema and table you used. Here
-that is the catalog (warehouse) named after the current database, namespace `public` and table
-`order_summary`, so the REST catalog needs a catalog with the same name as the database, and it
-must allow writes under the server's `location_prefix`. pg_lake creates the namespace if it
-does not exist. The catalog options of attached tables are not accepted, and neither is a
-server with `catalog_name`, so that the location of a table in the catalog cannot change after
-it was created. For the same reason, these tables cannot be renamed or moved to another schema.
+pg_lake names the table in the catalog after the schema and table you used: here namespace
+`public` and table `order_summary`. The catalog (warehouse) is the server's `catalog_name`,
+else the prefix the catalog advertises, else the current database name. pg_lake picks it
+once, when the table is created, and the table keeps it: changing the server's `catalog_name`
+later does not move existing tables, and the table's own `catalog_name` cannot be changed.
+A table in a catalog other than the database name has `catalog_name` in its options, and
+does not follow a database rename. pg_lake creates the namespace if it does not exist, and
+the catalog must allow writes under the server's `location_prefix`. The catalog options of
+attached tables are not accepted, so that the location of a table in the catalog cannot
+change after it was created. For the same reason, these tables cannot be renamed or moved to
+another schema. Tables in different catalogs cannot be changed in one transaction.
 
 {: .warning }
 pg_lake sends its changes to the catalog after the PostgreSQL transaction commits. If the

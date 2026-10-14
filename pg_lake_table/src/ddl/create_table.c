@@ -96,6 +96,7 @@ static void ErrorIfUsingGeometryWithoutSpatialAnalytics(List *columnDefList);
 static void ErrorIfUnsupportedLakeTable(CreateForeignTableStmt *createStmt);
 static void ErrorIfCreateForeignTableOnIcebergCatalog(CreateForeignTableStmt *createStmt);
 static void RecordIcebergCatalogServerDependency(Oid relationId, List *options);
+static char *ResolveWritableRestCatalogName(RestCatalogOptions * opts);
 static void ErrorIfWritableTableWithReservedColumnName(List *columnDefList, PgLakeTableType tableType);
 static void ErrorIfInvalidFilenameColumn(List *columnDefList);
 static bool IsConflictingColumnNameForReadParquet(const char *columnName);
@@ -384,6 +385,34 @@ ErrorIfCreateForeignTableOnIcebergCatalog(CreateForeignTableStmt *createStmt)
 						createStmt->servername),
 				 errhint("Use CREATE TABLE ... USING iceberg WITH (catalog = '%s') instead.",
 						 createStmt->servername)));
+}
+
+
+/*
+ * ResolveWritableRestCatalogName picks the catalog prefix a new writable REST
+ * catalog table is created under: the server's catalog_name if set, else the
+ * prefix the catalog advertises on /v1/config, else the database name.
+ *
+ * The built-in pg_lake_rest_catalog skips discovery and always uses the
+ * database name, so its tables keep the layout they have always had.  A
+ * catalog that rejects /v1/config (Polaris or Lakekeeper without a warehouse)
+ * yields no prefix, which also falls back to the database name.
+ */
+static char *
+ResolveWritableRestCatalogName(RestCatalogOptions * opts)
+{
+	if (opts->catalogName != NULL)
+		return pstrdup(opts->catalogName);
+
+	if (!opts->isBuiltin)
+	{
+		char	   *advertisedPrefix = FetchRestCatalogConfigPrefix(opts);
+
+		if (advertisedPrefix != NULL)
+			return advertisedPrefix;
+	}
+
+	return get_database_name(MyDatabaseId);
 }
 
 
@@ -929,11 +958,10 @@ ProcessCreateIcebergTableFromForeignTableStmt(ProcessUtilityParams * params)
 		if (!hasExternalCatalogReadOnlyOption)
 		{
 			/*
-			 * Writable tables always derive catalog_name, catalog_namespace,
-			 * and catalog_table_name from the database name, schema name, and
-			 * table name.  Explicit catalog options on the table are
-			 * rejected, and the server must not have catalog_name set either,
-			 * since that would conflict with the derived values.
+			 * Writable tables derive catalog_namespace and catalog_table_name
+			 * from the schema and table name, and the catalog prefix from the
+			 * server (see ResolveWritableRestCatalogName below).  Explicit
+			 * catalog options on the table are rejected.
 			 */
 			if (catalogNamespaceProvided != NULL ||
 				catalogTableNameProvided != NULL ||
@@ -949,12 +977,20 @@ ProcessCreateIcebergTableFromForeignTableStmt(ProcessUtilityParams * params)
 				char	   *catalogOptionValue = GetStringOption(createStmt->options, "catalog", false);
 				RestCatalogOptions *opts =
 					ResolveRestCatalogOptions(catalogOptionValue);
+				char	   *writableCatalogName = ResolveWritableRestCatalogName(opts);
 
-				if (opts->catalogName != NULL)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("writable REST catalog tables cannot use a server "
-									"with catalog_name set")));
+				/*
+				 * Store the prefix only when it is not the database name, so
+				 * tables on the default prefix behave exactly as before
+				 * (including following a database rename).  This is appended
+				 * after the explicit-options check above, which only looks at
+				 * what the user wrote.
+				 */
+				if (strcmp(writableCatalogName, get_database_name(MyDatabaseId)) != 0)
+					createStmt->options =
+						lappend(createStmt->options,
+								makeDefElem("catalog_name",
+											(Node *) makeString(writableCatalogName), -1));
 			}
 		}
 		else if (createStmt->base.tableElts == NIL && hasExternalCatalogReadOnlyOption)
@@ -1167,15 +1203,19 @@ ProcessCreateIcebergTableFromForeignTableStmt(ProcessUtilityParams * params)
 		 * the namespace registration will remain. We accept that tradeoff for
 		 * simplicity as re-registering an existing namespace is a no-op. For
 		 * a writable rest catalog iceberg table, the namespace is always the
-		 * table's schema name. Similarly, the catalog name is always the
-		 * database name. We normally encode that in GetRestCatalogName()
-		 * etc., but here we need to do it early before the table is created.
+		 * table's schema name.  The catalog prefix was resolved above and,
+		 * when it is not the database name, stored as catalog_name.
 		 */
 		char	   *catalogOptionValue = GetStringOption(createStmt->options, "catalog", false);
 		RestCatalogOptions *opts =
 			ResolveRestCatalogOptions(catalogOptionValue);
+		char	   *writableCatalogName =
+			GetStringOption(createStmt->options, "catalog_name", false);
 
-		RegisterNamespaceToRestCatalog(opts, get_database_name(MyDatabaseId),
+		if (writableCatalogName == NULL)
+			writableCatalogName = get_database_name(MyDatabaseId);
+
+		RegisterNamespaceToRestCatalog(opts, writableCatalogName,
 									   get_namespace_name(namespaceId));
 	}
 
